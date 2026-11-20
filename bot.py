@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- Инициализация базы данных ----------
+# ---------- Инициализация базы данных и индексов ----------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -48,8 +48,8 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
         except aiosqlite.OperationalError:
             pass
-        
-        # ⬇️ ВОТ ЭТИ СТРОКИ ДОБАВЛЯЮТ ИНДЕКСЫ ДЛЯ СКОРОСТИ ⬇️
+            
+        # Индексы для мгновенной работы на больших базах
         await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_user_date ON daily_stats (chat_id, user_id, date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_date ON daily_stats (chat_id, date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_user_chat ON daily_stats (user_id, chat_id)")
@@ -232,22 +232,20 @@ async def text_trigger_stats(message: types.Message):
 # ---------- Приветствие нового участника ----------
 @dp.message(F.new_chat_members)
 async def greet_new_member(message: types.Message):
-    # Игнорируем самого бота, если его добавили
     for new_member in message.new_chat_members:
         if new_member.is_bot:
             continue
             
         mention = get_mention(new_member.id, new_member.full_name)
-        
         text = (
             f"👋 Привет, {mention}!\n\n"
-            f"Я — бот-считалка. Я слежу за активностью в чате, считаю сообщения и выдаю статистику.\n\n"
+            f"Я — бот-считалка. Слежу за активностью в чате, считаю сообщения и выдаю статистику.\n\n"
             f"📖 <b>Полезные команды:</b>\n"
-            f"• /mystats — посмотреть свою стату и график\n"
-            f"• /top — посмотреть топ самых активных\n"
-            f"• /chatstats — общая статистика чата\n"
-            f"• /inactive — список тех, кто давно молчит\n\n"
-            f"💡 <i>Подсказка: можно просто написать «моя стата»</i>"
+            f"• /mystats — моя стата и график\n"
+            f"• /top — топ активных\n"
+            f"• /chatstats — статистика чата\n"
+            f"• /inactive — кто молчит\n\n"
+            f"💡 <i>Или просто напиши: «моя стата»</i>"
         )
         try:
             await message.reply(text, parse_mode="HTML")
@@ -356,7 +354,7 @@ async def send_top_data(message: types.Message, period: str, edit: bool = False)
     else:
         await message.answer(text, parse_mode="HTML")
 
-# ---------- НЕАКТИВ ----------
+# ---------- НЕАКТИВ (ОПТИМИЗИРОВАННЫЙ) ----------
 @dp.message(Command("inactive"))
 async def cmd_inactive(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
@@ -366,8 +364,7 @@ async def cmd_inactive(message: types.Message):
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
     async with aiosqlite.connect(DB_PATH) as db:
-        # ОДИН запрос: находим последнюю дату сообщения для каждого пользователя, 
-        # у которого эта дата меньше или равна вчерашнему дню
+        # ОДИН запрос: находим последнюю дату сообщения для каждого пользователя
         query = """
             SELECT user_id, MAX(date) as last_date
             FROM daily_stats
@@ -383,7 +380,7 @@ async def cmd_inactive(message: types.Message):
         if not inactive_users:
             return await message.answer("🎉 Все писали за последние сутки!")
 
-        # Получаем имена для этих пользователей (тоже одним запросом)
+        # Получаем имена одним запросом
         user_ids = [row[0] for row in inactive_users]
         placeholders = ",".join("?" * len(user_ids))
         async with db.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({placeholders})", user_ids) as cur:
@@ -396,7 +393,6 @@ async def cmd_inactive(message: types.Message):
         name = users_data.get(uid, f"User {uid}")
         mention = get_mention(uid, name)
         
-        # Считаем, сколько дней прошло
         last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
         days_ago = (today - last_date).days
         
