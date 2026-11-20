@@ -97,7 +97,11 @@ def get_rank(total_count: int) -> str:
     elif total_count < 1000: return "⭐ Ветеран"
     else: return "👑 Легенда"
 
+# ⬇️ ИСПРАВЛЕННАЯ ФУНКЦИЯ ⬇️
 def get_mention(user_id: int, full_name: str) -> str:
+    # Если имя пустое (None), подставляем User ID
+    if not full_name:
+        full_name = f"User {user_id}"
     safe_name = full_name.replace("<", "&lt;").replace(">", "&gt;")
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
