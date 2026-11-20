@@ -1,16 +1,16 @@
 import os
-import asyncio
 import logging
 from datetime import datetime, timedelta
 from io import BytesIO
 
 import aiosqlite
 import matplotlib
-matplotlib.use('Agg')  # Обязательно для серверной среды
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
@@ -81,20 +81,24 @@ async def get_user_total(chat_id: int, user_id: int) -> int:
             row = await cursor.fetchone()
             return row[0] or 0
 
+# Функция для создания кликабельного упоминания
+def get_mention(user_id: int, full_name: str) -> str:
+    # Очищаем имя от возможных HTML-тегов, чтобы не сломать разметку
+    safe_name = full_name.replace("<", "&lt;").replace(">", "&gt;")
+    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+
 # ---------- Обработчики команд ----------
 @dp.message(Command("start", "help"))
 async def cmd_help(message: types.Message):
     text = (
-        "📊 **Бот статистики**\n\n"
-        "**Команды:**\n"
+        "📊 <b>Бот статистики</b>\n\n"
+        "<b>Команды:</b>\n"
         "/whoami — посмотреть мою статистику и ранг\n"
-        "/top day — топ за сегодня\n"
-        "/top week — топ за 7 дней (скользящее окно)\n"
-        "/top all — топ за всё время\n"
+        "/top — интерактивное меню топов\n"
         "/inactive — список участников без сообщений за 7 дней\n"
         "/chart — график активности за 7 дней\n"
     )
-    await message.answer(text)
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("whoami"))
 async def cmd_whoami(message: types.Message):
@@ -122,25 +126,49 @@ async def cmd_whoami(message: types.Message):
         total = await get_user_total(chat_id, user.id)
     
     rank = get_rank(total)
+    mention = get_mention(user.id, user.full_name)
+    
     text = (
-        f"👤 **{user.full_name}**\n"
+        f"👤 <b>{mention}</b>\n"
         f"Ранг: {rank}\n"
         f"📅 Сегодня: {today_count or 0}\n"
         f"📅 За 7 дней: {week_count or 0}\n"
         f"📅 Всего: {total}"
     )
-    await message.reply(text)
+    await message.reply(text, parse_mode="HTML")
 
+# ---------- Топ с кнопками ----------
 @dp.message(Command("top"))
 async def cmd_top(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
     
     args = message.text.split()
-    if len(args) < 2:
-        return await message.answer("Укажите период: /top day, /top week или /top all")
+    if len(args) > 1:
+        period = args[1].lower()
+        if period in ["day", "week", "all"]:
+            return await send_top_data(message, period)
+        else:
+            return await message.answer("Неверный период. Используйте: day, week, all")
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📅 За сутки", callback_data="top_day"),
+        InlineKeyboardButton(text="🗓 За неделю", callback_data="top_week")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🏆 За всё время", callback_data="top_all")
+    )
     
-    period = args[1].lower()
+    await message.answer("Выберите период для топа:", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("top_"))
+async def process_top_callback(callback: types.CallbackQuery):
+    period = callback.data.split("_")[1]
+    await callback.answer()
+    await send_top_data(callback.message, period, edit=True)
+
+async def send_top_data(message: types.Message, period: str, edit: bool = False):
     chat_id = message.chat.id
     today = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
@@ -154,6 +182,7 @@ async def cmd_top(message: types.Message):
                 GROUP BY ds.user_id ORDER BY total DESC LIMIT 10
             """
             params = (chat_id, today)
+            title = "за сутки"
         elif period == "week":
             query = """
                 SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name
@@ -162,6 +191,7 @@ async def cmd_top(message: types.Message):
                 GROUP BY ds.user_id ORDER BY total DESC LIMIT 10
             """
             params = (chat_id, week_ago)
+            title = "за неделю"
         elif period == "all":
             query = """
                 SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name
@@ -170,21 +200,38 @@ async def cmd_top(message: types.Message):
                 GROUP BY ds.user_id ORDER BY total DESC LIMIT 10
             """
             params = (chat_id,)
+            title = "за всё время"
         else:
-            return await message.answer("Неверный период. Используйте: day, week, all")
+            return
         
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
     
     if not rows:
-        return await message.answer("Пока нет данных.")
+        text = "Пока нет данных."
+    else:
+        lines = [f"🏆 <b>Топ {title}</b>\n"]
+        for i, (uid, cnt, name) in enumerate(rows, 1):
+            display_name = name or f"User {uid}"
+            mention = get_mention(uid, display_name)
+            lines.append(f"{i}. {mention}: <b>{cnt}</b>")
+        text = "\n".join(lines)
     
-    lines = [f"🏆 **Топ ({period})**\n"]
-    for i, (uid, cnt, name) in enumerate(rows, 1):
-        display_name = name or f"User {uid}"
-        lines.append(f"{i}. {display_name}: **{cnt}**")
-    
-    await message.answer("\n".join(lines))
+    if edit:
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="📅 За сутки", callback_data="top_day"),
+            InlineKeyboardButton(text="🗓 За неделю", callback_data="top_week")
+        )
+        builder.row(
+            InlineKeyboardButton(text="🏆 За всё время", callback_data="top_all")
+        )
+        try:
+            await message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        except Exception:
+            pass
+    else:
+        await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("inactive"))
 async def cmd_inactive(message: types.Message):
@@ -218,11 +265,17 @@ async def cmd_inactive(message: types.Message):
         ) as cur:
             users = await cur.fetchall()
     
-    lines = ["😴 **Неактивные за 7 дней** (писали раньше, но молчат сейчас):\n"]
+    # Формируем список с упоминаниями. 
+    # Чтобы Telegram "пинганул" пользователей, мы используем HTML-ссылки, 
+    # но для гарантированного уведомления некоторые боты используют скрытые упоминания.
+    # Здесь мы просто делаем жирные кликабельные ссылки.
+    lines = ["😴 <b>Неактивные за 7 дней</b> (писали раньше, но молчат сейчас):\n"]
     for uid, name in users[:20]:
-        lines.append(f"• {name or uid}")
+        display_name = name or f"User {uid}"
+        mention = get_mention(uid, display_name)
+        lines.append(f"• {mention}")
     
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("chart"))
 async def cmd_chart(message: types.Message):
@@ -258,15 +311,13 @@ async def cmd_chart(message: types.Message):
     photo = BufferedInputFile(buf.read(), filename="chart.png")
     await message.reply_photo(photo, caption=f"📊 Ваша активность за 7 дней (всего: {sum(counts)})")
 
-# ---------- УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК (СЧИТАЕТ ВСЁ) ----------
+# ---------- Универсальный обработчик (считает всё) ----------
 @dp.message(~F.text.startswith("/"))
 async def handle_message(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
     if not message.from_user or message.from_user.is_bot:
         return
-    
-    # Игнорируем системные сообщения (вход/выход, смена названия и т.д.)
     if message.content_type in ["new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo", "pinned_message"]:
         return
 
@@ -276,6 +327,15 @@ async def handle_message(message: types.Message):
 # ---------- Точка входа (Webhook) ----------
 async def on_startup(bot: Bot):
     await init_db()
+    
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запустить бота / Помощь"),
+        BotCommand(command="whoami", description="Моя статистика и ранг"),
+        BotCommand(command="top", description="Топ участников (кнопки)"),
+        BotCommand(command="inactive", description="Кто молчит больше 7 дней"),
+        BotCommand(command="chart", description="Мой график активности"),
+    ])
+    
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
     await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET)
     logging.info(f"Webhook установлен: {webhook_url}")
@@ -296,3 +356,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
