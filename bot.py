@@ -3,6 +3,7 @@ import logging
 import json
 import urllib.parse
 import calendar
+import time
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -20,19 +21,19 @@ BASE_URL = os.getenv("BASE_URL", "")
 WEBHOOK_PATH = "/webhook"
 DB_PATH = os.path.join(os.getenv("DATA_DIR", "."), "stats.db")
 
-# Глобальное подключение к базе данных
 db_connection = None
+# Антиспам-кэш: {user_id: timestamp_последней_команды}
+command_cooldowns = {}
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- Инициализация базы данных и индексов ----------
+# ---------- Инициализация базы данных ----------
 async def init_db():
     global db_connection
     db_connection = await aiosqlite.connect(DB_PATH)
-    
-    # Ускорение работы SQLite
+    # Включаем быстрый режим WAL
     await db_connection.execute("PRAGMA journal_mode=WAL;")
     await db_connection.execute("PRAGMA synchronous=NORMAL;")
     
@@ -58,7 +59,6 @@ async def init_db():
     except aiosqlite.OperationalError:
         pass
         
-    # Индексы для моментального поиска
     await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_user_date ON daily_stats (chat_id, user_id, date)")
     await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_date ON daily_stats (chat_id, date)")
     
@@ -97,9 +97,7 @@ def get_rank(total_count: int) -> str:
     elif total_count < 1000: return "⭐ Ветеран"
     else: return "👑 Легенда"
 
-# ⬇️ ИСПРАВЛЕННАЯ ФУНКЦИЯ ⬇️
 def get_mention(user_id: int, full_name: str) -> str:
-    # Если имя пустое (None), подставляем User ID
     if not full_name:
         full_name = f"User {user_id}"
     safe_name = full_name.replace("<", "&lt;").replace(">", "&gt;")
@@ -132,6 +130,15 @@ def calculate_membership_duration(joined_at_str: str) -> str:
     if months > 0: parts.append(f"{months} мес.")
     if days > 0 or not parts: parts.append(f"{days} дн.")
     return " ".join(parts)
+
+# Проверка на спам (не чаще 1 раза в 3 секунды)
+def is_spamming(user_id: int) -> bool:
+    now = time.time()
+    last_time = command_cooldowns.get(user_id, 0)
+    if now - last_time < 3.0:
+        return True
+    command_cooldowns[user_id] = now
+    return False
 
 # ---------- Функция отправки статистики ----------
 async def send_user_stats(message: types.Message):
@@ -228,12 +235,16 @@ async def cmd_help(message: types.Message):
 async def cmd_mystats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
+    if is_spamming(message.from_user.id):
+        return # Игнорируем спам
     await send_user_stats(message)
 
 @dp.message(F.text.lower().in_(["моя стата", "моя стату", "моя статистика"]))
 async def text_trigger_stats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
+    if is_spamming(message.from_user.id):
+        return # Игнорируем спам
     await send_user_stats(message)
 
 # ---------- Приветствие нового участника ----------
@@ -242,7 +253,6 @@ async def greet_new_member(message: types.Message):
     for new_member in message.new_chat_members:
         if new_member.is_bot:
             continue
-            
         mention = get_mention(new_member.id, new_member.full_name)
         text = (
             f"👋 Привет, {mention}!\n\n"
@@ -263,14 +273,14 @@ async def greet_new_member(message: types.Message):
 async def cmd_chatstats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
-    
+    if is_spamming(message.from_user.id):
+        return
+        
     chat_id = message.chat.id
     async with db_connection.execute("SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
         total_msgs = (await cur.fetchone())[0] or 0
-        
     async with db_connection.execute("SELECT COUNT(DISTINCT user_id) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
         total_users = (await cur.fetchone())[0] or 0
-        
     async with db_connection.execute("""
         SELECT u.full_name, SUM(ds.msg_count) as cnt 
         FROM daily_stats ds JOIN users u ON ds.user_id = u.user_id 
@@ -290,6 +300,9 @@ async def cmd_chatstats(message: types.Message):
 async def cmd_top(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
+    if is_spamming(message.from_user.id):
+        return
+
     args = message.text.split()
     if len(args) > 1:
         period = args[1].lower()
@@ -310,6 +323,9 @@ async def cmd_top(message: types.Message):
 
 @dp.callback_query(F.data.startswith("top_"))
 async def process_top_callback(callback: types.CallbackQuery):
+    if is_spamming(callback.from_user.id):
+        await callback.answer("Не так быстро! Подожди пару секунд.")
+        return
     period = callback.data.split("_")[1]
     await callback.answer()
     await send_top_data(callback.message, period, edit=True)
@@ -362,12 +378,14 @@ async def send_top_data(message: types.Message, period: str, edit: bool = False)
     else:
         await message.answer(text, parse_mode="HTML")
 
-# ---------- НЕАКТИВ (ОПТИМИЗИРОВАННЫЙ) ----------
+# ---------- НЕАКТИВ ----------
 @dp.message(Command("inactive"))
 async def cmd_inactive(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
-    
+    if is_spamming(message.from_user.id):
+        return
+        
     chat_id = message.chat.id
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
@@ -409,7 +427,7 @@ async def cmd_inactive(message: types.Message):
         
     await message.answer("\n".join(lines), parse_mode="HTML")
 
-# ---------- Универсальный обработчик ----------
+# ---------- Универсальный обработчик (считает всё) ----------
 @dp.message(~F.text.startswith("/"))
 async def handle_message(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
