@@ -22,7 +22,6 @@ WEBHOOK_PATH = "/webhook"
 DB_PATH = os.path.join(os.getenv("DATA_DIR", "."), "stats.db")
 
 db_connection = None
-# Антиспам-кэш: {user_id: timestamp_последней_команды}
 command_cooldowns = {}
 
 logging.basicConfig(level=logging.INFO)
@@ -33,25 +32,18 @@ dp = Dispatcher()
 async def init_db():
     global db_connection
     db_connection = await aiosqlite.connect(DB_PATH)
-    # Включаем быстрый режим WAL
     await db_connection.execute("PRAGMA journal_mode=WAL;")
     await db_connection.execute("PRAGMA synchronous=NORMAL;")
     
     await db_connection.execute("""
         CREATE TABLE IF NOT EXISTS daily_stats (
-            chat_id INTEGER,
-            user_id INTEGER,
-            date TEXT,
-            msg_count INTEGER DEFAULT 0,
+            chat_id INTEGER, user_id INTEGER, date TEXT, msg_count INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id, date)
         )
     """)
     await db_connection.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            joined_at TEXT
+            user_id INTEGER PRIMARY KEY, full_name TEXT, username TEXT, joined_at TEXT
         )
     """)
     try:
@@ -61,7 +53,6 @@ async def init_db():
         
     await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_user_date ON daily_stats (chat_id, user_id, date)")
     await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_date ON daily_stats (chat_id, date)")
-    
     await db_connection.commit()
 
 # ---------- Вспомогательные функции ----------
@@ -131,18 +122,16 @@ def calculate_membership_duration(joined_at_str: str) -> str:
     if days > 0 or not parts: parts.append(f"{days} дн.")
     return " ".join(parts)
 
-# Проверка на спам (не чаще 1 раза в 3 секунды)
 def is_spamming(user_id: int) -> bool:
     now = time.time()
     last_time = command_cooldowns.get(user_id, 0)
-    if now - last_time < 3.0:
+    if now - last_time < 2.0:  # Уменьшили кулдаун до 2 секунд
         return True
     command_cooldowns[user_id] = now
     return False
 
-# ---------- Функция отправки статистики ----------
-async def send_user_stats(message: types.Message):
-    user = message.from_user
+# ---------- Отправка статистики (универсальная) ----------
+async def send_stats_for_user(message: types.Message, target_user: types.User):
     chat_id = message.chat.id
     today = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
@@ -150,23 +139,23 @@ async def send_user_stats(message: types.Message):
     
     async with db_connection.execute(
         "SELECT msg_count FROM daily_stats WHERE chat_id=? AND user_id=? AND date=?",
-        (chat_id, user.id, today)
+        (chat_id, target_user.id, today)
     ) as cur:
         today_count = (await cur.fetchone() or [0])[0]
         
     async with db_connection.execute(
         "SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=? AND user_id=? AND date>=?",
-        (chat_id, user.id, week_ago)
+        (chat_id, target_user.id, week_ago)
     ) as cur:
         week_count = (await cur.fetchone() or [0])[0]
         
     async with db_connection.execute(
         "SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=? AND user_id=?",
-        (chat_id, user.id)
+        (chat_id, target_user.id)
     ) as cur:
         total = (await cur.fetchone() or [0])[0]
         
-    async with db_connection.execute("SELECT joined_at FROM users WHERE user_id=?", (user.id,)) as cur:
+    async with db_connection.execute("SELECT joined_at FROM users WHERE user_id=?", (target_user.id,)) as cur:
         row = await cur.fetchone()
         joined_at = row[0] if row else None
     
@@ -174,13 +163,13 @@ async def send_user_stats(message: types.Message):
     for d in days:
         async with db_connection.execute(
             "SELECT msg_count FROM daily_stats WHERE chat_id=? AND user_id=? AND date=?",
-            (chat_id, user.id, d)
+            (chat_id, target_user.id, d)
         ) as cur:
             row = await cur.fetchone()
             counts.append(row[0] if row else 0)
 
     rank = get_rank(total or 0)
-    mention = get_mention(user.id, user.full_name)
+    mention = get_mention(target_user.id, target_user.full_name)
     duration = calculate_membership_duration(joined_at)
     
     text = (
@@ -223,11 +212,11 @@ async def cmd_help(message: types.Message):
     text = (
         "📊 <b>Бот статистики</b>\n\n"
         "<b>Команды:</b>\n"
-        "/mystats — моя статистика, стаж и график\n"
+        "/mystats (или «моя стата») — моя статистика\n"
+        "/whois — ответьте на сообщение, чтобы узнать стату автора\n"
         "/top — интерактивное меню топов\n"
         "/chatstats — общая статистика чата\n"
-        "/inactive — кто молчит больше суток\n\n"
-        "💡 Также можно просто написать <b>«моя стата»</b>"
+        "/inactive — кто молчит больше суток\n"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -236,16 +225,61 @@ async def cmd_mystats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
     if is_spamming(message.from_user.id):
-        return # Игнорируем спам
-    await send_user_stats(message)
+        return
+    await send_stats_for_user(message, message.from_user)
 
-@dp.message(F.text.lower().in_(["моя стата", "моя стату", "моя статистика"]))
+# ---------- КОНТЕКСТНЫЙ ОТВЕТ ("стата" в ответ) ----------
+@dp.message(F.text.lower().in_(["моя стата", "моя стату", "моя статистика", "стата"]))
 async def text_trigger_stats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
     if is_spamming(message.from_user.id):
-        return # Игнорируем спам
-    await send_user_stats(message)
+        return
+    
+    # Если это ответ на сообщение (reply)
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+        if target_user.is_bot:
+            return await message.reply("У ботов нет статистики.")
+        await send_stats_for_user(message, target_user)
+    else:
+        # Если просто написали "стата", показываем свою
+        await send_stats_for_user(message, message.from_user)
+
+# ---------- КОМАНДА /whois ----------
+@dp.message(Command("whois"))
+async def cmd_whois(message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return await message.answer("Эта команда работает только в группах.")
+    if is_spamming(message.from_user.id):
+        return
+
+    # 1. Если это ответ на сообщение
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+        if target_user.is_bot:
+            return await message.reply("У ботов нет статистики.")
+        return await send_stats_for_user(message, target_user)
+
+    # 2. Если упомянули через @username
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith("@"):
+        username = args[1][1:] # убираем @
+        async with db_connection.execute("SELECT user_id, full_name FROM users WHERE username=?", (username,)) as cur:
+            row = await cur.fetchone()
+            if row:
+                # Создаем фейковый объект User для отправки
+                class FakeUser:
+                    def __init__(self, uid, name):
+                        self.id = uid
+                        self.full_name = name
+                await send_stats_for_user(message, FakeUser(row[0], row[1]))
+            else:
+                await message.reply("Пользователь с таким юзернеймом не найден в базе.")
+            return
+
+    # 3. Если просто /whois без ответа и упоминания
+    await message.reply("Ответьте на сообщение человека или напишите /whois @username, чтобы узнать его стату.")
 
 # ---------- Приветствие нового участника ----------
 @dp.message(F.new_chat_members)
@@ -258,11 +292,11 @@ async def greet_new_member(message: types.Message):
             f"👋 Привет, {mention}!\n\n"
             f"Я — бот-считалка. Слежу за активностью в чате, считаю сообщения и выдаю статистику.\n\n"
             f"📖 <b>Полезные команды:</b>\n"
-            f"• /mystats — моя стата и график\n"
+            f"• /mystats или <i>«моя стата»</i> — моя стата\n"
+            f"• /whois (ответом на сообщение) — стата автора\n"
             f"• /top — топ активных\n"
             f"• /chatstats — статистика чата\n"
-            f"• /inactive — кто молчит\n\n"
-            f"💡 <i>Или просто напиши: «моя стата»</i>"
+            f"• /inactive — кто молчит\n"
         )
         try:
             await message.reply(text, parse_mode="HTML")
@@ -427,7 +461,7 @@ async def cmd_inactive(message: types.Message):
         
     await message.answer("\n".join(lines), parse_mode="HTML")
 
-# ---------- Универсальный обработчик (считает всё) ----------
+# ---------- Универсальный обработчик ----------
 @dp.message(~F.text.startswith("/"))
 async def handle_message(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
@@ -445,6 +479,7 @@ async def on_startup(bot: Bot):
     await bot.set_my_commands([
         BotCommand(command="start", description="Запустить бота / Помощь"),
         BotCommand(command="mystats", description="Моя статистика и график"),
+        BotCommand(command="whois", description="Статистика автора (ответом)"),
         BotCommand(command="top", description="Топ участников (кнопки)"),
         BotCommand(command="chatstats", description="Общая статистика чата"),
         BotCommand(command="inactive", description="Кто молчит больше суток"),
