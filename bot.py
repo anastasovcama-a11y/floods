@@ -366,42 +366,44 @@ async def cmd_inactive(message: types.Message):
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT DISTINCT user_id FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
-            all_ids = {row[0] for row in await cur.fetchall()}
-        async with db.execute("SELECT DISTINCT user_id FROM daily_stats WHERE chat_id=? AND date>=?", (chat_id, yesterday)) as cur:
-            active_ids = {row[0] for row in await cur.fetchall()}
+        # ОДИН запрос: находим последнюю дату сообщения для каждого пользователя, 
+        # у которого эта дата меньше или равна вчерашнему дню
+        query = """
+            SELECT user_id, MAX(date) as last_date
+            FROM daily_stats
+            WHERE chat_id = ?
+            GROUP BY user_id
+            HAVING last_date < ?
+            ORDER BY last_date ASC
+            LIMIT 20
+        """
+        async with db.execute(query, (chat_id, yesterday)) as cur:
+            inactive_users = await cur.fetchall()
             
-        inactive_ids = all_ids - active_ids
-        if not inactive_ids:
+        if not inactive_users:
             return await message.answer("🎉 Все писали за последние сутки!")
-            
-        inactive_list = []
-        for uid in inactive_ids:
-            async with db.execute("SELECT MAX(date) FROM daily_stats WHERE chat_id=? AND user_id=?", (chat_id, uid)) as cur:
-                last_date_str = (await cur.fetchone())[0]
-                if last_date_str:
-                    last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
-                    today = datetime.now().date()
-                    days_ago = (today - last_date).days
-                    if days_ago == 0: days_ago = 1
-                    inactive_list.append((uid, last_date_str, days_ago))
-        
-        inactive_list.sort(key=lambda x: x[2], reverse=True)
-        
-        ids_to_fetch = [item[0] for item in inactive_list[:20]]
-        if not ids_to_fetch: return
-        
-        placeholders = ",".join("?" * len(ids_to_fetch))
-        async with db.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({placeholders})", ids_to_fetch) as cur:
+
+        # Получаем имена для этих пользователей (тоже одним запросом)
+        user_ids = [row[0] for row in inactive_users]
+        placeholders = ",".join("?" * len(user_ids))
+        async with db.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({placeholders})", user_ids) as cur:
             users_data = {row[0]: row[1] for row in await cur.fetchall()}
             
     lines = ["😴 <b>Кто молчит (более суток)</b>\n"]
-    for uid, last_date_str, days_ago in inactive_list[:20]:
+    today = datetime.now().date()
+    
+    for uid, last_date_str in inactive_users:
         name = users_data.get(uid, f"User {uid}")
         mention = get_mention(uid, name)
+        
+        # Считаем, сколько дней прошло
+        last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+        days_ago = (today - last_date).days
+        
         if days_ago == 1: time_str = "1 день"
         elif days_ago < 5: time_str = f"{days_ago} дня"
         else: time_str = f"{days_ago} дней"
+        
         lines.append(f"• {mention} — молчит {time_str}")
         
     await message.answer("\n".join(lines), parse_mode="HTML")
