@@ -17,9 +17,9 @@ from aiohttp import web
 # ---------- Конфигурация ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my_secret_token")
-BASE_URL = os.getenv("BASE_URL", "")  # Например: https://my-pool-counter.bothost.tech
+BASE_URL = os.getenv("BASE_URL", "")
 WEBHOOK_PATH = "/webhook"
-DB_PATH = "stats.db"
+DB_PATH = os.path.join(os.getenv("DATA_DIR", "."), "stats.db")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -92,7 +92,7 @@ async def cmd_help(message: types.Message):
         "/top week — топ за 7 дней (скользящее окно)\n"
         "/top all — топ за всё время\n"
         "/inactive — список участников без сообщений за 7 дней\n"
-        "/chart — график активности за 7 дней (моя активность)\n"
+        "/chart — график активности за 7 дней\n"
     )
     await message.answer(text)
 
@@ -258,14 +258,18 @@ async def cmd_chart(message: types.Message):
     photo = BufferedInputFile(buf.read(), filename="chart.png")
     await message.reply_photo(photo, caption=f"📊 Ваша активность за 7 дней (всего: {sum(counts)})")
 
-# ---------- Универсальный обработчик сообщений ----------
-@dp.message(F.text & ~F.text.startswith("/"))
+# ---------- УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК (СЧИТАЕТ ВСЁ) ----------
+@dp.message(~F.text.startswith("/"))
 async def handle_message(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
     if not message.from_user or message.from_user.is_bot:
         return
     
+    # Игнорируем системные сообщения (вход/выход, смена названия и т.д.)
+    if message.content_type in ["new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo", "pinned_message"]:
+        return
+
     await update_user_info(message.from_user)
     await record_message(message.chat.id, message.from_user.id)
 
@@ -287,10 +291,8 @@ def main():
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     
-    # ⬇️ ИСПРАВЛЕННАЯ СТРОКА ⬇️
     port = int(os.getenv("PORT") or os.getenv("SERVER_PORT") or 8080)
     web.run_app(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
-
