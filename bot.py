@@ -20,69 +20,75 @@ BASE_URL = os.getenv("BASE_URL", "")
 WEBHOOK_PATH = "/webhook"
 DB_PATH = os.path.join(os.getenv("DATA_DIR", "."), "stats.db")
 
+# Глобальное подключение к базе данных
+db_connection = None
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ---------- Инициализация базы данных и индексов ----------
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS daily_stats (
-                chat_id INTEGER,
-                user_id INTEGER,
-                date TEXT,
-                msg_count INTEGER DEFAULT 0,
-                PRIMARY KEY (chat_id, user_id, date)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                full_name TEXT,
-                username TEXT,
-                joined_at TEXT
-            )
-        """)
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
-        except aiosqlite.OperationalError:
-            pass
-            
-        # Индексы для мгновенной работы на больших базах
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_user_date ON daily_stats (chat_id, user_id, date)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_date ON daily_stats (chat_id, date)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_user_chat ON daily_stats (user_id, chat_id)")
+    global db_connection
+    db_connection = await aiosqlite.connect(DB_PATH)
+    
+    # Ускорение работы SQLite
+    await db_connection.execute("PRAGMA journal_mode=WAL;")
+    await db_connection.execute("PRAGMA synchronous=NORMAL;")
+    
+    await db_connection.execute("""
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            chat_id INTEGER,
+            user_id INTEGER,
+            date TEXT,
+            msg_count INTEGER DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id, date)
+        )
+    """)
+    await db_connection.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            username TEXT,
+            joined_at TEXT
+        )
+    """)
+    try:
+        await db_connection.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
+    except aiosqlite.OperationalError:
+        pass
         
-        await db.commit()
+    # Индексы для моментального поиска
+    await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_user_date ON daily_stats (chat_id, user_id, date)")
+    await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_date ON daily_stats (chat_id, date)")
+    
+    await db_connection.commit()
 
 # ---------- Вспомогательные функции ----------
 async def update_user_info(user: types.User):
     today = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,)) as cur:
-            exists = await cur.fetchone()
-        if not exists:
-            await db.execute(
-                "INSERT INTO users (user_id, full_name, username, joined_at) VALUES (?, ?, ?, ?)",
-                (user.id, user.full_name, user.username or "", today)
-            )
-        else:
-            await db.execute(
-                "UPDATE users SET full_name=?, username=? WHERE user_id=?",
-                (user.full_name, user.username or "", user.id)
-            )
-        await db.commit()
+    async with db_connection.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,)) as cur:
+        exists = await cur.fetchone()
+    if not exists:
+        await db_connection.execute(
+            "INSERT INTO users (user_id, full_name, username, joined_at) VALUES (?, ?, ?, ?)",
+            (user.id, user.full_name, user.username or "", today)
+        )
+    else:
+        await db_connection.execute(
+            "UPDATE users SET full_name=?, username=? WHERE user_id=?",
+            (user.full_name, user.username or "", user.id)
+        )
+    await db_connection.commit()
 
 async def record_message(chat_id: int, user_id: int):
     today = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO daily_stats (chat_id, user_id, date, msg_count)
-            VALUES (?, ?, ?, 1)
-            ON CONFLICT(chat_id, user_id, date) DO UPDATE SET msg_count = msg_count + 1
-        """, (chat_id, user_id, today))
-        await db.commit()
+    await db_connection.execute("""
+        INSERT INTO daily_stats (chat_id, user_id, date, msg_count)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(chat_id, user_id, date) DO UPDATE SET msg_count = msg_count + 1
+    """, (chat_id, user_id, today))
+    await db_connection.commit()
 
 def get_rank(total_count: int) -> str:
     if total_count < 50: return "🐣 Новичок"
@@ -90,15 +96,6 @@ def get_rank(total_count: int) -> str:
     elif total_count < 500: return "🔥 Активист"
     elif total_count < 1000: return "⭐ Ветеран"
     else: return "👑 Легенда"
-
-async def get_user_total(chat_id: int, user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] or 0
 
 def get_mention(user_id: int, full_name: str) -> str:
     safe_name = full_name.replace("<", "&lt;").replace(">", "&gt;")
@@ -140,32 +137,38 @@ async def send_user_stats(message: types.Message):
     week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     days = [(datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT msg_count FROM daily_stats WHERE chat_id=? AND user_id=? AND date=?",
-            (chat_id, user.id, today)
-        ) as cur:
-            today_count = (await cur.fetchone() or [0])[0]
-        async with db.execute(
-            "SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=? AND user_id=? AND date>=?",
-            (chat_id, user.id, week_ago)
-        ) as cur:
-            week_count = (await cur.fetchone() or [0])[0]
-        total = await get_user_total(chat_id, user.id)
-        async with db.execute("SELECT joined_at FROM users WHERE user_id=?", (user.id,)) as cur:
-            row = await cur.fetchone()
-            joined_at = row[0] if row else None
+    async with db_connection.execute(
+        "SELECT msg_count FROM daily_stats WHERE chat_id=? AND user_id=? AND date=?",
+        (chat_id, user.id, today)
+    ) as cur:
+        today_count = (await cur.fetchone() or [0])[0]
         
-        counts = []
-        for d in days:
-            async with db.execute(
-                "SELECT msg_count FROM daily_stats WHERE chat_id=? AND user_id=? AND date=?",
-                (chat_id, user.id, d)
-            ) as cur:
-                row = await cur.fetchone()
-                counts.append(row[0] if row else 0)
+    async with db_connection.execute(
+        "SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=? AND user_id=? AND date>=?",
+        (chat_id, user.id, week_ago)
+    ) as cur:
+        week_count = (await cur.fetchone() or [0])[0]
+        
+    async with db_connection.execute(
+        "SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=? AND user_id=?",
+        (chat_id, user.id)
+    ) as cur:
+        total = (await cur.fetchone() or [0])[0]
+        
+    async with db_connection.execute("SELECT joined_at FROM users WHERE user_id=?", (user.id,)) as cur:
+        row = await cur.fetchone()
+        joined_at = row[0] if row else None
     
-    rank = get_rank(total)
+    counts = []
+    for d in days:
+        async with db_connection.execute(
+            "SELECT msg_count FROM daily_stats WHERE chat_id=? AND user_id=? AND date=?",
+            (chat_id, user.id, d)
+        ) as cur:
+            row = await cur.fetchone()
+            counts.append(row[0] if row else 0)
+
+    rank = get_rank(total or 0)
     mention = get_mention(user.id, user.full_name)
     duration = calculate_membership_duration(joined_at)
     
@@ -175,7 +178,7 @@ async def send_user_stats(message: types.Message):
         f"📅 В чате: {duration}\n"
         f"📊 Сегодня: {today_count or 0}\n"
         f"📊 За 7 дней: {week_count or 0}\n"
-        f"📊 Всего: {total}"
+        f"📊 Всего: {total or 0}"
     )
     
     labels = [d[5:] for d in days]
@@ -258,17 +261,18 @@ async def cmd_chatstats(message: types.Message):
         return await message.answer("Эта команда работает только в группах.")
     
     chat_id = message.chat.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
-            total_msgs = (await cur.fetchone())[0] or 0
-        async with db.execute("SELECT COUNT(DISTINCT user_id) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
-            total_users = (await cur.fetchone())[0] or 0
-        async with db.execute("""
-            SELECT u.full_name, SUM(ds.msg_count) as cnt 
-            FROM daily_stats ds JOIN users u ON ds.user_id = u.user_id 
-            WHERE ds.chat_id=? GROUP BY ds.user_id ORDER BY cnt DESC LIMIT 1
-        """, (chat_id,)) as cur:
-            top_user = await cur.fetchone()
+    async with db_connection.execute("SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
+        total_msgs = (await cur.fetchone())[0] or 0
+        
+    async with db_connection.execute("SELECT COUNT(DISTINCT user_id) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
+        total_users = (await cur.fetchone())[0] or 0
+        
+    async with db_connection.execute("""
+        SELECT u.full_name, SUM(ds.msg_count) as cnt 
+        FROM daily_stats ds JOIN users u ON ds.user_id = u.user_id 
+        WHERE ds.chat_id=? GROUP BY ds.user_id ORDER BY cnt DESC LIMIT 1
+    """, (chat_id,)) as cur:
+        top_user = await cur.fetchone()
             
     text = f"📈 <b>Статистика чата</b>\n\n"
     text += f"💬 Всего сообщений: <b>{total_msgs}</b>\n"
@@ -311,23 +315,23 @@ async def send_top_data(message: types.Message, period: str, edit: bool = False)
     today = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        if period == "day":
-            query = "SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name FROM daily_stats ds LEFT JOIN users u ON ds.user_id = u.user_id WHERE ds.chat_id=? AND ds.date=? GROUP BY ds.user_id ORDER BY total DESC LIMIT 10"
-            params = (chat_id, today)
-            title = "за сутки"
-        elif period == "week":
-            query = "SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name FROM daily_stats ds LEFT JOIN users u ON ds.user_id = u.user_id WHERE ds.chat_id=? AND ds.date>=? GROUP BY ds.user_id ORDER BY total DESC LIMIT 10"
-            params = (chat_id, week_ago)
-            title = "за неделю"
-        elif period == "all":
-            query = "SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name FROM daily_stats ds LEFT JOIN users u ON ds.user_id = u.user_id WHERE ds.chat_id=? GROUP BY ds.user_id ORDER BY total DESC LIMIT 10"
-            params = (chat_id,)
-            title = "за всё время"
-        else:
-            return
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
+    if period == "day":
+        query = "SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name FROM daily_stats ds LEFT JOIN users u ON ds.user_id = u.user_id WHERE ds.chat_id=? AND ds.date=? GROUP BY ds.user_id ORDER BY total DESC LIMIT 10"
+        params = (chat_id, today)
+        title = "за сутки"
+    elif period == "week":
+        query = "SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name FROM daily_stats ds LEFT JOIN users u ON ds.user_id = u.user_id WHERE ds.chat_id=? AND ds.date>=? GROUP BY ds.user_id ORDER BY total DESC LIMIT 10"
+        params = (chat_id, week_ago)
+        title = "за неделю"
+    elif period == "all":
+        query = "SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name FROM daily_stats ds LEFT JOIN users u ON ds.user_id = u.user_id WHERE ds.chat_id=? GROUP BY ds.user_id ORDER BY total DESC LIMIT 10"
+        params = (chat_id,)
+        title = "за всё время"
+    else:
+        return
+        
+    async with db_connection.execute(query, params) as cursor:
+        rows = await cursor.fetchall()
     
     if not rows:
         text = "Пока нет данных."
@@ -363,28 +367,25 @@ async def cmd_inactive(message: types.Message):
     chat_id = message.chat.id
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        # ОДИН запрос: находим последнюю дату сообщения для каждого пользователя
-        query = """
-            SELECT user_id, MAX(date) as last_date
-            FROM daily_stats
-            WHERE chat_id = ?
-            GROUP BY user_id
-            HAVING last_date < ?
-            ORDER BY last_date ASC
-            LIMIT 20
-        """
-        async with db.execute(query, (chat_id, yesterday)) as cur:
-            inactive_users = await cur.fetchall()
-            
-        if not inactive_users:
-            return await message.answer("🎉 Все писали за последние сутки!")
+    query = """
+        SELECT user_id, MAX(date) as last_date
+        FROM daily_stats
+        WHERE chat_id = ?
+        GROUP BY user_id
+        HAVING last_date < ?
+        ORDER BY last_date ASC
+        LIMIT 20
+    """
+    async with db_connection.execute(query, (chat_id, yesterday)) as cur:
+        inactive_users = await cur.fetchall()
+        
+    if not inactive_users:
+        return await message.answer("🎉 Все писали за последние сутки!")
 
-        # Получаем имена одним запросом
-        user_ids = [row[0] for row in inactive_users]
-        placeholders = ",".join("?" * len(user_ids))
-        async with db.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({placeholders})", user_ids) as cur:
-            users_data = {row[0]: row[1] for row in await cur.fetchall()}
+    user_ids = [row[0] for row in inactive_users]
+    placeholders = ",".join("?" * len(user_ids))
+    async with db_connection.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({placeholders})", user_ids) as cur:
+        users_data = {row[0]: row[1] for row in await cur.fetchall()}
             
     lines = ["😴 <b>Кто молчит (более суток)</b>\n"]
     today = datetime.now().date()
