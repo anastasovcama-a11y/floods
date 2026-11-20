@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import urllib.parse
+import calendar
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -55,7 +56,6 @@ async def update_user_info(user: types.User):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,)) as cur:
             exists = await cur.fetchone()
-            
         if not exists:
             await db.execute(
                 "INSERT INTO users (user_id, full_name, username, joined_at) VALUES (?, ?, ?, ?)",
@@ -106,36 +106,28 @@ def calculate_membership_duration(joined_at_str: str) -> str:
     except ValueError:
         return "Неизвестно"
     today = datetime.now().date()
-    months = (today.year - joined_date.year) * 12 + today.month - joined_date.month
-    if today.day < joined_date.day:
+    years = today.year - joined_date.year
+    months = today.month - joined_date.month
+    days = today.day - joined_date.day
+
+    if days < 0:
         months -= 1
-    years = months // 12
-    months_left = months % 12
+        prev_month = today.month - 1 if today.month > 1 else 12
+        prev_year = today.year if today.month > 1 else today.year - 1
+        days += calendar.monthrange(prev_year, prev_month)[1]
+
+    if months < 0:
+        years -= 1
+        months += 12
+        
     parts = []
     if years > 0: parts.append(f"{years} г.")
-    if months_left > 0: parts.append(f"{months_left} мес.")
-    if not parts:
-        total_days = (today - joined_date).days
-        return f"{total_days} дн."
+    if months > 0: parts.append(f"{months} мес.")
+    if days > 0 or not parts: parts.append(f"{days} дн.")
     return " ".join(parts)
 
-# ---------- Обработчики команд ----------
-@dp.message(Command("start", "help"))
-async def cmd_help(message: types.Message):
-    text = (
-        "📊 <b>Бот статистики</b>\n\n"
-        "<b>Команды:</b>\n"
-        "/whoami — посмотреть мою статистику, ранг и график\n"
-        "/top — интерактивное меню топов\n"
-        "/inactive — список участников без сообщений за 7 дней\n"
-    )
-    await message.answer(text, parse_mode="HTML")
-
-@dp.message(Command("whoami"))
-async def cmd_whoami(message: types.Message):
-    if message.chat.type not in ["group", "supergroup"]:
-        return await message.answer("Эта команда работает только в группах.")
-    
+# ---------- Функция отправки статистики ----------
+async def send_user_stats(message: types.Message):
     user = message.from_user
     chat_id = message.chat.id
     today = datetime.now().strftime("%Y-%m-%d")
@@ -158,7 +150,6 @@ async def cmd_whoami(message: types.Message):
             row = await cur.fetchone()
             joined_at = row[0] if row else None
         
-        # Данные для графика
         counts = []
         for d in days:
             async with db.execute(
@@ -172,7 +163,6 @@ async def cmd_whoami(message: types.Message):
     mention = get_mention(user.id, user.full_name)
     duration = calculate_membership_duration(joined_at)
     
-    # Формируем текст (он пойдет в подпись к картинке)
     text = (
         f"👤 <b>{mention}</b>\n"
         f"Ранг: {rank}\n"
@@ -182,7 +172,6 @@ async def cmd_whoami(message: types.Message):
         f"📊 Всего: {total}"
     )
     
-    # Формируем URL для графика через QuickChart
     labels = [d[5:] for d in days]
     chart_config = {
         "type": "bar",
@@ -196,26 +185,93 @@ async def cmd_whoami(message: types.Message):
                 "borderWidth": 1
             }]
         },
-        "options": {
-            "title": {"display": False}, # Убираем заголовок, чтобы не дублировать имя
-            "scales": {"yAxes": [{"ticks": {"beginAtZero": True}}]}
-        }
+        "options": {"title": {"display": False}, "scales": {"yAxes": [{"ticks": {"beginAtZero": True}}]}}
     }
     
     encoded_config = urllib.parse.quote(json.dumps(chart_config))
     chart_url = f"https://quickchart.io/chart?c={encoded_config}&w=600&h=200&bkg=white"
     
     try:
-        # Отправляем картинку с подписью (текстом статистики)
-        await message.reply_photo(
-            photo=chart_url, 
-            caption=text, 
-            parse_mode="HTML"
-        )
+        await message.reply_photo(photo=chart_url, caption=text, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка отправки графика: {e}")
-        # Если не удалось отправить фото, отправляем хотя бы текст
         await message.reply(text, parse_mode="HTML")
+
+# ---------- Обработчики команд ----------
+@dp.message(Command("start", "help"))
+async def cmd_help(message: types.Message):
+    text = (
+        "📊 <b>Бот статистики</b>\n\n"
+        "<b>Команды:</b>\n"
+        "/mystats — моя статистика, стаж и график\n"
+        "/top — интерактивное меню топов\n"
+        "/chatstats — общая статистика чата\n"
+        "/inactive — кто молчит больше суток\n\n"
+        "💡 Также можно просто написать <b>«моя стата»</b>"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("mystats"))
+async def cmd_mystats(message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return await message.answer("Эта команда работает только в группах.")
+    await send_user_stats(message)
+
+@dp.message(F.text.lower().in_(["моя стата", "моя стату", "моя статистика"]))
+async def text_trigger_stats(message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    await send_user_stats(message)
+
+# ---------- Приветствие нового участника ----------
+@dp.message(F.new_chat_members)
+async def greet_new_member(message: types.Message):
+    # Игнорируем самого бота, если его добавили
+    for new_member in message.new_chat_members:
+        if new_member.is_bot:
+            continue
+            
+        mention = get_mention(new_member.id, new_member.full_name)
+        
+        text = (
+            f"👋 Привет, {mention}!\n\n"
+            f"Я — бот-считалка. Я слежу за активностью в чате, считаю сообщения и выдаю статистику.\n\n"
+            f"📖 <b>Полезные команды:</b>\n"
+            f"• /mystats — посмотреть свою стату и график\n"
+            f"• /top — посмотреть топ самых активных\n"
+            f"• /chatstats — общая статистика чата\n"
+            f"• /inactive — список тех, кто давно молчит\n\n"
+            f"💡 <i>Подсказка: можно просто написать «моя стата»</i>"
+        )
+        try:
+            await message.reply(text, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Ошибка приветствия: {e}")
+
+@dp.message(Command("chatstats"))
+async def cmd_chatstats(message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return await message.answer("Эта команда работает только в группах.")
+    
+    chat_id = message.chat.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT SUM(msg_count) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
+            total_msgs = (await cur.fetchone())[0] or 0
+        async with db.execute("SELECT COUNT(DISTINCT user_id) FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
+            total_users = (await cur.fetchone())[0] or 0
+        async with db.execute("""
+            SELECT u.full_name, SUM(ds.msg_count) as cnt 
+            FROM daily_stats ds JOIN users u ON ds.user_id = u.user_id 
+            WHERE ds.chat_id=? GROUP BY ds.user_id ORDER BY cnt DESC LIMIT 1
+        """, (chat_id,)) as cur:
+            top_user = await cur.fetchone()
+            
+    text = f"📈 <b>Статистика чата</b>\n\n"
+    text += f"💬 Всего сообщений: <b>{total_msgs}</b>\n"
+    text += f"👥 Уникальных участников: <b>{total_users}</b>\n"
+    if top_user:
+        text += f"🏆 Самый активный: <b>{top_user[0]}</b> ({top_user[1]} сообщ.)"
+    await message.answer(text, parse_mode="HTML")
 
 # ---------- Топ с кнопками ----------
 @dp.message(Command("top"))
@@ -274,8 +330,7 @@ async def send_top_data(message: types.Message, period: str, edit: bool = False)
     else:
         lines = [f"🏆 <b>Топ {title}</b>\n"]
         for i, (uid, cnt, name) in enumerate(rows, 1):
-            display_name = name or f"User {uid}"
-            mention = get_mention(uid, display_name)
+            mention = get_mention(uid, name or f"User {uid}")
             lines.append(f"{i}. {mention}: <b>{cnt}</b>")
         text = "\n".join(lines)
     
@@ -295,32 +350,54 @@ async def send_top_data(message: types.Message, period: str, edit: bool = False)
     else:
         await message.answer(text, parse_mode="HTML")
 
+# ---------- НЕАКТИВ ----------
 @dp.message(Command("inactive"))
 async def cmd_inactive(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
+    
     chat_id = message.chat.id
-    week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT DISTINCT user_id FROM daily_stats WHERE chat_id=? AND date>=?", (chat_id, week_ago)) as cur:
-            active_ids = {row[0] for row in await cur.fetchall()}
         async with db.execute("SELECT DISTINCT user_id FROM daily_stats WHERE chat_id=?", (chat_id,)) as cur:
             all_ids = {row[0] for row in await cur.fetchall()}
-        
+        async with db.execute("SELECT DISTINCT user_id FROM daily_stats WHERE chat_id=? AND date>=?", (chat_id, yesterday)) as cur:
+            active_ids = {row[0] for row in await cur.fetchall()}
+            
         inactive_ids = all_ids - active_ids
         if not inactive_ids:
-            return await message.answer("🎉 Все активны за последнюю неделю!")
+            return await message.answer("🎉 Все писали за последние сутки!")
+            
+        inactive_list = []
+        for uid in inactive_ids:
+            async with db.execute("SELECT MAX(date) FROM daily_stats WHERE chat_id=? AND user_id=?", (chat_id, uid)) as cur:
+                last_date_str = (await cur.fetchone())[0]
+                if last_date_str:
+                    last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                    today = datetime.now().date()
+                    days_ago = (today - last_date).days
+                    if days_ago == 0: days_ago = 1
+                    inactive_list.append((uid, last_date_str, days_ago))
         
-        placeholders = ",".join("?" * len(inactive_ids))
-        async with db.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({placeholders})", list(inactive_ids)) as cur:
-            users = await cur.fetchall()
-    
-    lines = ["😴 <b>Неактивные за 7 дней</b> (писали раньше, но молчат сейчас):\n"]
-    for uid, name in users[:20]:
-        display_name = name or f"User {uid}"
-        mention = get_mention(uid, display_name)
-        lines.append(f"• {mention}")
+        inactive_list.sort(key=lambda x: x[2], reverse=True)
+        
+        ids_to_fetch = [item[0] for item in inactive_list[:20]]
+        if not ids_to_fetch: return
+        
+        placeholders = ",".join("?" * len(ids_to_fetch))
+        async with db.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({placeholders})", ids_to_fetch) as cur:
+            users_data = {row[0]: row[1] for row in await cur.fetchall()}
+            
+    lines = ["😴 <b>Кто молчит (более суток)</b>\n"]
+    for uid, last_date_str, days_ago in inactive_list[:20]:
+        name = users_data.get(uid, f"User {uid}")
+        mention = get_mention(uid, name)
+        if days_ago == 1: time_str = "1 день"
+        elif days_ago < 5: time_str = f"{days_ago} дня"
+        else: time_str = f"{days_ago} дней"
+        lines.append(f"• {mention} — молчит {time_str}")
+        
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 # ---------- Универсальный обработчик ----------
@@ -340,9 +417,10 @@ async def on_startup(bot: Bot):
     await init_db()
     await bot.set_my_commands([
         BotCommand(command="start", description="Запустить бота / Помощь"),
-        BotCommand(command="whoami", description="Моя статистика и график"),
+        BotCommand(command="mystats", description="Моя статистика и график"),
         BotCommand(command="top", description="Топ участников (кнопки)"),
-        BotCommand(command="inactive", description="Кто молчит больше 7 дней"),
+        BotCommand(command="chatstats", description="Общая статистика чата"),
+        BotCommand(command="inactive", description="Кто молчит больше суток"),
     ])
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
     await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET)
