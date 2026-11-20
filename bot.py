@@ -48,6 +48,12 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
         except aiosqlite.OperationalError:
             pass
+        
+        # ⬇️ ВОТ ЭТИ СТРОКИ ДОБАВЛЯЮТ ИНДЕКСЫ ДЛЯ СКОРОСТИ ⬇️
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_user_date ON daily_stats (chat_id, user_id, date)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_date ON daily_stats (chat_id, date)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_user_chat ON daily_stats (user_id, chat_id)")
+        
         await db.commit()
 
 # ---------- Вспомогательные функции ----------
