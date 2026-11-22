@@ -4,6 +4,7 @@ import json
 import urllib.parse
 import calendar
 import time
+import asyncio
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -24,9 +25,36 @@ DB_PATH = os.path.join(os.getenv("DATA_DIR", "."), "stats.db")
 db_connection = None
 command_cooldowns = {}
 
+message_buffer = {}
+buffer_running = True
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# ---------- Фоновая задача для сброса буфера в базу ----------
+async def flush_buffer_task():
+    global message_buffer
+    while buffer_running:
+        await asyncio.sleep(2)
+        if not message_buffer:
+            continue
+            
+        current_buffer = message_buffer.copy()
+        message_buffer.clear()
+        
+        try:
+            for (chat_id, user_id, date), count in current_buffer.items():
+                await db_connection.execute("""
+                    INSERT INTO daily_stats (chat_id, user_id, date, msg_count)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(chat_id, user_id, date) DO UPDATE SET msg_count = msg_count + ?
+                """, (chat_id, user_id, date, count, count))
+            await db_connection.commit()
+        except Exception as e:
+            logging.error(f"Ошибка записи в базу (буфер): {e}")
+            for k, v in current_buffer.items():
+                message_buffer[k] = message_buffer.get(k, 0) + v
 
 # ---------- Инициализация базы данных ----------
 async def init_db():
@@ -54,6 +82,8 @@ async def init_db():
     await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_user_date ON daily_stats (chat_id, user_id, date)")
     await db_connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_chat_date ON daily_stats (chat_id, date)")
     await db_connection.commit()
+    
+    asyncio.create_task(flush_buffer_task())
 
 # ---------- Вспомогательные функции ----------
 async def update_user_info(user: types.User):
@@ -65,21 +95,7 @@ async def update_user_info(user: types.User):
             "INSERT INTO users (user_id, full_name, username, joined_at) VALUES (?, ?, ?, ?)",
             (user.id, user.full_name, user.username or "", today)
         )
-    else:
-        await db_connection.execute(
-            "UPDATE users SET full_name=?, username=? WHERE user_id=?",
-            (user.full_name, user.username or "", user.id)
-        )
-    await db_connection.commit()
-
-async def record_message(chat_id: int, user_id: int):
-    today = datetime.now().strftime("%Y-%m-%d")
-    await db_connection.execute("""
-        INSERT INTO daily_stats (chat_id, user_id, date, msg_count)
-        VALUES (?, ?, ?, 1)
-        ON CONFLICT(chat_id, user_id, date) DO UPDATE SET msg_count = msg_count + 1
-    """, (chat_id, user_id, today))
-    await db_connection.commit()
+        await db_connection.commit()
 
 def get_rank(total_count: int) -> str:
     if total_count < 50: return "🐣 Новичок"
@@ -125,18 +141,30 @@ def calculate_membership_duration(joined_at_str: str) -> str:
 def is_spamming(user_id: int) -> bool:
     now = time.time()
     last_time = command_cooldowns.get(user_id, 0)
-    if now - last_time < 2.0:  # Уменьшили кулдаун до 2 секунд
+    if now - last_time < 1.5:
         return True
     command_cooldowns[user_id] = now
     return False
 
-# ---------- Отправка статистики (универсальная) ----------
+# ---------- Отправка статистики ----------
 async def send_stats_for_user(message: types.Message, target_user: types.User):
     chat_id = message.chat.id
     today = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     days = [(datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
     
+    global message_buffer
+    if message_buffer:
+        current_buffer = message_buffer.copy()
+        message_buffer.clear()
+        for (cid, uid, d), count in current_buffer.items():
+            await db_connection.execute("""
+                INSERT INTO daily_stats (chat_id, user_id, date, msg_count)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id, date) DO UPDATE SET msg_count = msg_count + ?
+            """, (cid, uid, d, count, count))
+        await db_connection.commit()
+
     async with db_connection.execute(
         "SELECT msg_count FROM daily_stats WHERE chat_id=? AND user_id=? AND date=?",
         (chat_id, target_user.id, today)
@@ -216,7 +244,8 @@ async def cmd_help(message: types.Message):
         "/whois — ответьте на сообщение, чтобы узнать стату автора\n"
         "/top — интерактивное меню топов\n"
         "/chatstats — общая статистика чата\n"
-        "/inactive — кто молчит больше суток\n"
+        "/inactive — кто молчит больше суток\n\n"
+        "💡 Также можно писать: <b>«топ сутки»</b>, <b>«топ неделя»</b>, <b>«топ все»</b>"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -228,7 +257,6 @@ async def cmd_mystats(message: types.Message):
         return
     await send_stats_for_user(message, message.from_user)
 
-# ---------- КОНТЕКСТНЫЙ ОТВЕТ ("стата" в ответ) ----------
 @dp.message(F.text.lower().in_(["моя стата", "моя стату", "моя статистика", "стата"]))
 async def text_trigger_stats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
@@ -236,17 +264,14 @@ async def text_trigger_stats(message: types.Message):
     if is_spamming(message.from_user.id):
         return
     
-    # Если это ответ на сообщение (reply)
     if message.reply_to_message and message.reply_to_message.from_user:
         target_user = message.reply_to_message.from_user
         if target_user.is_bot:
             return await message.reply("У ботов нет статистики.")
         await send_stats_for_user(message, target_user)
     else:
-        # Если просто написали "стата", показываем свою
         await send_stats_for_user(message, message.from_user)
 
-# ---------- КОМАНДА /whois ----------
 @dp.message(Command("whois"))
 async def cmd_whois(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
@@ -254,21 +279,18 @@ async def cmd_whois(message: types.Message):
     if is_spamming(message.from_user.id):
         return
 
-    # 1. Если это ответ на сообщение
     if message.reply_to_message and message.reply_to_message.from_user:
         target_user = message.reply_to_message.from_user
         if target_user.is_bot:
             return await message.reply("У ботов нет статистики.")
         return await send_stats_for_user(message, target_user)
 
-    # 2. Если упомянули через @username
     args = message.text.split()
     if len(args) > 1 and args[1].startswith("@"):
-        username = args[1][1:] # убираем @
+        username = args[1][1:]
         async with db_connection.execute("SELECT user_id, full_name FROM users WHERE username=?", (username,)) as cur:
             row = await cur.fetchone()
             if row:
-                # Создаем фейковый объект User для отправки
                 class FakeUser:
                     def __init__(self, uid, name):
                         self.id = uid
@@ -278,10 +300,8 @@ async def cmd_whois(message: types.Message):
                 await message.reply("Пользователь с таким юзернеймом не найден в базе.")
             return
 
-    # 3. Если просто /whois без ответа и упоминания
-    await message.reply("Ответьте на сообщение человека или напишите /whois @username, чтобы узнать его стату.")
+    await message.reply("Ответьте на сообщение человека или напишите /whois @username.")
 
-# ---------- Приветствие нового участника ----------
 @dp.message(F.new_chat_members)
 async def greet_new_member(message: types.Message):
     for new_member in message.new_chat_members:
@@ -355,10 +375,36 @@ async def cmd_top(message: types.Message):
     )
     await message.answer("Выберите период для топа:", reply_markup=builder.as_markup())
 
+# ---------- Текстовые триггеры для топа ----------
+@dp.message(F.text.lower().in_(["топ сутки", "топ за сутки", "топ день"]))
+async def text_top_day(message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    if is_spamming(message.from_user.id):
+        return
+    await send_top_data(message, "day")
+
+@dp.message(F.text.lower().in_(["топ неделя", "топ за неделю"]))
+async def text_top_week(message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    if is_spamming(message.from_user.id):
+        return
+    await send_top_data(message, "week")
+
+@dp.message(F.text.lower().in_(["топ все", "топ за все время", "топ всё"]))
+async def text_top_all(message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    if is_spamming(message.from_user.id):
+        return
+    await send_top_data(message, "all")
+
+# ---------- Обработчик кнопок ----------
 @dp.callback_query(F.data.startswith("top_"))
 async def process_top_callback(callback: types.CallbackQuery):
     if is_spamming(callback.from_user.id):
-        await callback.answer("Не так быстро! Подожди пару секунд.")
+        await callback.answer("Не так быстро!")
         return
     period = callback.data.split("_")[1]
     await callback.answer()
@@ -369,6 +415,18 @@ async def send_top_data(message: types.Message, period: str, edit: bool = False)
     today = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     
+    global message_buffer
+    if message_buffer:
+        current_buffer = message_buffer.copy()
+        message_buffer.clear()
+        for (cid, uid, d), count in current_buffer.items():
+            await db_connection.execute("""
+                INSERT INTO daily_stats (chat_id, user_id, date, msg_count)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id, date) DO UPDATE SET msg_count = msg_count + ?
+            """, (cid, uid, d, count, count))
+        await db_connection.commit()
+
     if period == "day":
         query = "SELECT ds.user_id, SUM(ds.msg_count) as total, u.full_name FROM daily_stats ds LEFT JOIN users u ON ds.user_id = u.user_id WHERE ds.chat_id=? AND ds.date=? GROUP BY ds.user_id ORDER BY total DESC LIMIT 10"
         params = (chat_id, today)
@@ -470,8 +528,10 @@ async def handle_message(message: types.Message):
         return
     if message.content_type in ["new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo", "pinned_message"]:
         return
-    await update_user_info(message.from_user)
-    await record_message(message.chat.id, message.from_user.id)
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    key = (message.chat.id, message.from_user.id, today)
+    message_buffer[key] = message_buffer.get(key, 0) + 1
 
 # ---------- Точка входа (Webhook) ----------
 async def on_startup(bot: Bot):
@@ -488,8 +548,23 @@ async def on_startup(bot: Bot):
     await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET)
     logging.info(f"Webhook установлен: {webhook_url}")
 
+async def on_shutdown(bot: Bot):
+    global buffer_running
+    buffer_running = False
+    if message_buffer:
+        for (cid, uid, d), count in message_buffer.items():
+            await db_connection.execute("""
+                INSERT INTO daily_stats (chat_id, user_id, date, msg_count)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id, date) DO UPDATE SET msg_count = msg_count + ?
+            """, (cid, uid, d, count, count))
+        await db_connection.commit()
+    await db_connection.close()
+
 def main():
     dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    
     app = web.Application()
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
