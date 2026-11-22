@@ -239,25 +239,19 @@ async def send_stats_for_user(message: types.Message, target_user: types.User):
 async def cmd_help(message: types.Message):
     text = (
         "📊 <b>Бот статистики</b>\n\n"
+        "<b>Все команды работают через префикс `!`</b>\n\n"
         "<b>Команды:</b>\n"
-        "/mystats (или «моя стата») — моя статистика\n"
-        "/whois — ответьте на сообщение, чтобы узнать стату автора\n"
-        "/top — интерактивное меню топов\n"
-        "/chatstats — общая статистика чата\n"
-        "/inactive — кто молчит больше суток\n\n"
-        "💡 Также можно писать: <b>«топ сутки»</b>, <b>«топ неделя»</b>, <b>«топ все»</b>"
+        "• <b>!стата</b> — моя статистика (или ответьте на сообщение с этой командой)\n"
+        "• <b>!кто ты</b> — статистика автора сообщения (ответом)\n"
+        "• <b>!топ7</b> — топ за 7 дней (или <b>!топ неделя</b>)\n"
+        "• <b>!топ24</b> — топ за сутки (или <b>!топ сутки</b>)\n"
+        "• <b>!топ</b> — меню с кнопками\n"
+        "• <b>!инфо</b> — общая статистика чата\n"
+        "• <b>!спящие</b> — кто молчит больше суток\n"
     )
     await message.answer(text, parse_mode="HTML")
 
-@dp.message(Command("mystats"))
-async def cmd_mystats(message: types.Message):
-    if message.chat.type not in ["group", "supergroup"]:
-        return await message.answer("Эта команда работает только в группах.")
-    if is_spamming(message.from_user.id):
-        return
-    await send_stats_for_user(message, message.from_user)
-
-@dp.message(F.text.lower().in_(["моя стата", "моя стату", "моя статистика", "стата"]))
+@dp.message(F.text.lower().in_(["!стата", "!моя стата", "!моя стату", "!моя статистика"]))
 async def text_trigger_stats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
@@ -272,10 +266,10 @@ async def text_trigger_stats(message: types.Message):
     else:
         await send_stats_for_user(message, message.from_user)
 
-@dp.message(Command("whois"))
-async def cmd_whois(message: types.Message):
+@dp.message(F.text.lower().in_(["!кто ты", "!кто"]))
+async def text_trigger_whois(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
-        return await message.answer("Эта команда работает только в группах.")
+        return
     if is_spamming(message.from_user.id):
         return
 
@@ -284,23 +278,8 @@ async def cmd_whois(message: types.Message):
         if target_user.is_bot:
             return await message.reply("У ботов нет статистики.")
         return await send_stats_for_user(message, target_user)
-
-    args = message.text.split()
-    if len(args) > 1 and args[1].startswith("@"):
-        username = args[1][1:]
-        async with db_connection.execute("SELECT user_id, full_name FROM users WHERE username=?", (username,)) as cur:
-            row = await cur.fetchone()
-            if row:
-                class FakeUser:
-                    def __init__(self, uid, name):
-                        self.id = uid
-                        self.full_name = name
-                await send_stats_for_user(message, FakeUser(row[0], row[1]))
-            else:
-                await message.reply("Пользователь с таким юзернеймом не найден в базе.")
-            return
-
-    await message.reply("Ответьте на сообщение человека или напишите /whois @username.")
+    
+    await message.reply("Ответьте на сообщение человека, чтобы узнать его статистику.")
 
 @dp.message(F.new_chat_members)
 async def greet_new_member(message: types.Message):
@@ -311,19 +290,19 @@ async def greet_new_member(message: types.Message):
         text = (
             f"👋 Привет, {mention}!\n\n"
             f"Я — бот-считалка. Слежу за активностью в чате, считаю сообщения и выдаю статистику.\n\n"
-            f"📖 <b>Полезные команды:</b>\n"
-            f"• /mystats или <i>«моя стата»</i> — моя стата\n"
-            f"• /whois (ответом на сообщение) — стата автора\n"
-            f"• /top — топ активных\n"
-            f"• /chatstats — статистика чата\n"
-            f"• /inactive — кто молчит\n"
+            f"📖 <b>Полезные команды (все с !):</b>\n"
+            f"• <b>!стата</b> — моя стата\n"
+            f"• <b>!кто ты</b> — стата автора (ответом)\n"
+            f"• <b>!топ</b> — меню топов\n"
+            f"• <b>!инфо</b> — статистика чата\n"
+            f"• <b>!спящие</b> — кто молчит\n"
         )
         try:
             await message.reply(text, parse_mode="HTML")
         except Exception as e:
             logging.error(f"Ошибка приветствия: {e}")
 
-@dp.message(Command("chatstats"))
+@dp.message(F.text.lower().in_(["!инфо", "!сводка", "!стат чата"]))
 async def cmd_chatstats(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
@@ -349,21 +328,12 @@ async def cmd_chatstats(message: types.Message):
         text += f"🏆 Самый активный: <b>{top_user[0]}</b> ({top_user[1]} сообщ.)"
     await message.answer(text, parse_mode="HTML")
 
-# ---------- Топ с кнопками ----------
-@dp.message(Command("top"))
+@dp.message(F.text.lower().in_(["!топ"]))
 async def cmd_top(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
     if is_spamming(message.from_user.id):
         return
-
-    args = message.text.split()
-    if len(args) > 1:
-        period = args[1].lower()
-        if period in ["day", "week", "all"]:
-            return await send_top_data(message, period)
-        else:
-            return await message.answer("Неверный период. Используйте: day, week, all")
 
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -375,8 +345,7 @@ async def cmd_top(message: types.Message):
     )
     await message.answer("Выберите период для топа:", reply_markup=builder.as_markup())
 
-# ---------- Текстовые триггеры для топа ----------
-@dp.message(F.text.lower().in_(["топ сутки", "топ за сутки", "топ день"]))
+@dp.message(F.text.lower().in_(["!топ24", "!топ сутки", "!топ день"]))
 async def text_top_day(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
@@ -384,7 +353,7 @@ async def text_top_day(message: types.Message):
         return
     await send_top_data(message, "day")
 
-@dp.message(F.text.lower().in_(["топ неделя", "топ за неделю"]))
+@dp.message(F.text.lower().in_(["!топ7", "!топ неделя", "!топ за неделю"]))
 async def text_top_week(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
@@ -392,7 +361,7 @@ async def text_top_week(message: types.Message):
         return
     await send_top_data(message, "week")
 
-@dp.message(F.text.lower().in_(["топ все", "топ за все время", "топ всё"]))
+@dp.message(F.text.lower().in_(["!топ всё", "!топ все", "!топ за все время"]))
 async def text_top_all(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
@@ -400,7 +369,6 @@ async def text_top_all(message: types.Message):
         return
     await send_top_data(message, "all")
 
-# ---------- Обработчик кнопок ----------
 @dp.callback_query(F.data.startswith("top_"))
 async def process_top_callback(callback: types.CallbackQuery):
     if is_spamming(callback.from_user.id):
@@ -470,8 +438,7 @@ async def send_top_data(message: types.Message, period: str, edit: bool = False)
     else:
         await message.answer(text, parse_mode="HTML")
 
-# ---------- НЕАКТИВ ----------
-@dp.message(Command("inactive"))
+@dp.message(F.text.lower().in_(["!спящие", "!тишина"]))
 async def cmd_inactive(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return await message.answer("Эта команда работает только в группах.")
@@ -520,7 +487,7 @@ async def cmd_inactive(message: types.Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 # ---------- Универсальный обработчик ----------
-@dp.message(~F.text.startswith("/"))
+@dp.message(~F.text.startswith("!") & ~F.text.startswith("/"))
 async def handle_message(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
@@ -537,12 +504,7 @@ async def handle_message(message: types.Message):
 async def on_startup(bot: Bot):
     await init_db()
     await bot.set_my_commands([
-        BotCommand(command="start", description="Запустить бота / Помощь"),
-        BotCommand(command="mystats", description="Моя статистика и график"),
-        BotCommand(command="whois", description="Статистика автора (ответом)"),
-        BotCommand(command="top", description="Топ участников (кнопки)"),
-        BotCommand(command="chatstats", description="Общая статистика чата"),
-        BotCommand(command="inactive", description="Кто молчит больше суток"),
+        BotCommand(command="start", description="Помощь по командам"),
     ])
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
     await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET)
